@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+	<name>tigrillo_tracking</name>
+	<version>1.0.0</version>
+	<description>Track the Tigrillo Robot using a kinect setup</description>
+
+	<maintainer email="gabriel.urbain@ugent.be">Gabriel Urbain</maintainer>
+	<license>MIT</license>
+	<url type="website">https://gurbain.be/</url>
+	<author email="gabriel.urbain@ugent.be">Gabriel Urbain</author>
+	
+	<buildtool_depend>catkin</buildtool_depend>
+
+	<build_depend>rospy</build_depend>
+	<build_depend>message_generation</build_depend>
+	<build_export_depend>message_runtime</build_export_depend>
+
+	<exec_depend>rospy</exec_depend>
+    <exec_depend>message_runtime</exec_depend>
+
+    <depend>gazebo_msgs</depend>
+    <depend>std_msgs</depend>
+    <depend>actionlib_msgs</depend>
+
+</package>

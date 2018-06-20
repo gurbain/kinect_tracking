@@ -1,0 +1,2 @@
+- git: {local-name: fato_tracker, uri: 'https://github.com/CoffeRobot/fato.git', version: master}
+- git: {local-name: iai_kinect2, uri: 'https://github.com/code-iai/iai_kinect2.git', version: master}

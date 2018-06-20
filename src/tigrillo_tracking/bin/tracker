@@ -1,0 +1,331 @@
+#!/usr/bin/python
+
+""" ROS marker tracker """
+
+import cv2
+import numpy as np
+import rospy as ros
+import struct
+import sys
+import time
+
+from image_geometry import PinholeCameraModel
+from geometry_msgs.msg import Point, Quaternion, Pose, PoseStamped
+from nav_msgs.msg import Path
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+import sensor_msgs.point_cloud2 as pc2
+import tf
+from cv_bridge import CvBridge, CvBridgeError
+
+from tigrillo_tracking.camshift import CamShift
+from tigrillo_tracking.drawing import Cropper, Selecter
+from tigrillo_tracking.geometry import  CustomTF
+from tigrillo_tracking import utils
+
+class Tracker:
+
+    def __init__(self):
+
+        self.cv_bridge = CvBridge()
+        self.tracker_front = None
+        self.tracker_back = None
+        self.cropper_front = None
+        self.cropper_back = None
+
+        self.front_center = None
+        self.back_center = None
+
+        self.image_name = "/kinect2/hd/image_color_rect"
+        self.depth_name = "/kinect2/hd/image_depth_rect"
+        self.point_name = "/kinect2/hd/points"
+        self.camera_model_name = "/kinect2/hd/camera_info"
+        self.pose_name = "/tigrillo_rob/pose"
+        self.path_name = "/tigrillo_rob/path"
+        self.path = None
+        self.path_buf_it = 0
+        self.path_buf_max = 200
+
+        self.cv_img = 0
+        self.cv_depth = 0
+        self.img_win_name = "Image Window"
+        self.depth_win_name = "Depth Window"
+
+        self.world_point_list = [[0.6, 0, 0], [1.2, 0, 0], [1.8, 0, 0],
+                                 [2.4, 0, 0], [0.6, 0.6, 0], [1.2, 0.6, 0.4],
+                                 [1.8, 0.6, 0], [2.4, 0.6, 0]]
+        self.world_point_curr = 0
+        self.save_tf = True
+        self.load_tf = True
+        self.tf_cam_world = None
+
+        self.state = "init"
+        self.is_finished = False
+        self.img_can_show = False
+        self.depth_can_show = False
+
+    def start(self):
+
+        # Ros init
+        ros.init_node('robot_tracker', anonymous=True)
+        
+        # Image and point clouds subscribers
+        self.image_sub = ros.Subscriber(self.image_name, Image, self.__analyze_img)
+        self.depth_sub = ros.Subscriber(self.depth_name, Image, self.__get_depth)
+        #self.point_sub = ros.Subscriber(self.point_name, PointCloud2, self.__get_points)
+        
+        # Camera calibration
+        self.camera_model = PinholeCameraModel()
+        self.camera_model_sub = ros.Subscriber(self.camera_model_name, CameraInfo, self.__get_calib_camera_model)
+        
+        # Pose publication topic
+        self.pose_pub = ros.Publisher(self.pose_name, PoseStamped, queue_size=1)
+        self.path_pub = ros.Publisher(self.path_name, Path, queue_size=1)
+        self.path = Path()
+        
+        # Open Window
+        cv2.namedWindow(self.img_win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.img_win_name, 1500, 1000)
+
+    def stop(self):
+
+        cv2.destroyAllWindows()
+        utils.cleanup()
+    
+    def to_cv(self, img, encoding="bgr8"):
+
+        try:
+            cv_img = self.cv_bridge.imgmsg_to_cv2(img, encoding)
+            return cv_img
+        except CvBridgeError as e:
+            print(e)
+            return -1
+
+    def __fsm(self):
+
+        if type(self.cv_img) is not int and not self.is_finished:
+
+            # Initial State
+            if self.state == "init":
+
+                if not self.load_tf:
+                    self.state = "set_point_" + str(self.world_point_curr)
+                    self.img_can_show = True
+                    ros.loginfo("State: " + self.state + \
+                                ": Select coordinate " + \
+                                str(self.world_point_list[self.world_point_curr]) + \
+                                " on the image!")
+                    self.world_tf = CustomTF(save_tf=self.save_tf)
+                    self.selecter = Selecter(self, self.img_win_name)
+                    self.selecter.start()
+                    time.sleep(1)
+                    u, v = self.selecter.get_points()
+                    p = self.__uv_to_xyz(u, v)
+                    if not any(x in p for x in [0, np.nan]):
+                        self.world_tf.append(self.world_point_list[self.world_point_curr], 
+                                         p)
+                    self.world_point_curr += 1
+                    self.state = "set_point_" + str(self.world_point_curr)
+                else:
+                    self.world_tf = CustomTF(self.save_tf)
+                    self.tf_cam_world = self.world_tf.get_tf_cam_world(self.load_tf)
+                    ros.loginfo("Crop the front ROI!")
+                    self.cropper_front = Cropper(self, self.img_win_name)
+                    self.cropper_front.start()
+                    self.state = "cropping_front"
+
+            # Iterative State to get points
+            elif "set_point" in self.state:
+
+                self.img_can_show = True
+                if self.selecter.is_finished:
+                    if self.world_point_curr >= len(self.world_point_list):
+                        self.selecter.stop()
+                        del self.selecter
+                        self.tf_cam_world = self.world_tf.get_tf_cam_world()
+                        ros.logwarn("World Frame transformation has been computer given the set of points")
+                        ros.loginfo("Crop the front ROI!")
+                        time.sleep(1)
+                        self.cropper_front = Cropper(self, self.img_win_name)
+                        self.cropper_front.start()
+                        self.state = "cropping_front"
+                    else:
+                        ros.loginfo("State: " + self.state + \
+                                    ": Select coordinate " + \
+                                    str(self.world_point_list[self.world_point_curr]) + \
+                                    " on the image!")
+                        u, v = self.selecter.get_points()
+                        p = self.__uv_to_xyz(u, v)
+                        if not any(x in p for x in [0, np.nan]):
+                            self.world_tf.append(self.world_point_list[self.world_point_curr], 
+                                         p)
+                        self.selecter.stop()
+                        del self.selecter
+                        self.selecter = Selecter(self, self.img_win_name)
+                        self.selecter.start()
+                        self.state = "set_point_" + str(self.world_point_curr)
+                    self.world_point_curr += 1
+
+            # Cropping Front State
+            elif self.state == "cropping_front":
+
+                if self.cropper_front.is_finished:
+                    ros.loginfo("Front RoI is cropped. Crop the back ROI!")
+                    self.cropper_front.stop()
+                    c = min(self.cropper_front.ix, self.cropper_front.fx)
+                    w = max(self.cropper_front.ix, self.cropper_front.fx) - c
+                    r = min(self.cropper_front.iy, self.cropper_front.fy)
+                    h = max(self.cropper_front.iy, self.cropper_front.fy) - r
+                    self.tracker_front = CamShift(r, h, c, w)
+                    self.cropper_front = None
+                    self.cropper_back = Cropper(self, self.img_win_name)
+                    self.cropper_back.start()
+                    self.state = "cropping_back"
+
+            # Cropping Back State
+            elif self.state == "cropping_back":
+
+                self.front_center = self.tracker_front.process(self.cv_img)
+                self.cv_img = self.tracker_front.draw(self.cv_img, "green")
+
+                if self.cropper_back.is_finished:
+                    ros.loginfo("RoI are cropped. Start tracking!")
+                    self.cropper_back.stop()
+                    c = min(self.cropper_back.ix, self.cropper_back.fx)
+                    w = max(self.cropper_back.ix, self.cropper_back.fx) - c
+                    r = min(self.cropper_back.iy, self.cropper_back.fy)
+                    h = max(self.cropper_back.iy, self.cropper_back.fy) - r
+                    self.tracker_back = CamShift(r, h, c, w)
+                    self.state = "tracking"
+                    self.front_center = self.tracker_front.process(self.cv_img)
+                    self.back_center = self.tracker_back.process(self.cv_img)
+
+            # Tracking State
+            elif self.state == "tracking":
+
+                self.front_center = self.tracker_front.process(self.cv_img)
+                self.back_center = self.tracker_back.process(self.cv_img)
+                self.cv_img = self.tracker_front.draw(self.cv_img, "green")
+                self.cv_img = self.tracker_back.draw(self.cv_img, "red")
+                self.img_can_show = True
+
+    def __get_calib_camera_model(self, msg):
+
+        self.camera_model.fromCameraInfo(msg)
+        time.sleep(5)
+
+    def __uv_to_xyz(self, u, v):
+
+        r = self.camera_model.projectPixelTo3dRay((u, v))
+        z = self.cv_depth[v, u]
+        x = r[0] * z / r[2]
+        y = r[1] * z / r[2]
+
+        return np.array([x/1000, y/1000, z/1000])
+
+    def __get_points(self, pcl):
+
+        if self.state == "tracking":
+
+            # Get point cloud
+            fmt = pc2._get_struct_fmt(pcl.is_bigendian, pcl.fields)
+            unpack_from = struct.Struct(fmt).unpack_from
+
+            # Get tracked centers image coordinates (U,V)
+            u_front = int(self.front_center[0][0] + self.front_center[1][0] / 2)
+            v_front = int(self.front_center[0][1] + self.front_center[1][1] / 2)
+            u_back = int(self.back_center[0][0] + self.back_center[1][0] / 2)
+            v_back = int(self.back_center[0][1] + self.back_center[1][1] / 2)
+
+            # Get World coordinates (X,Y,Z)
+            p_front = unpack_from(pcl.data, (pcl.row_step * v_front) + (pcl.point_step * u_front))
+            p_back = unpack_from(pcl.data, (pcl.row_step * v_back) + (pcl.point_step * u_back))
+            
+            print "POINTS:   ", int(p_front[0]*1000), int(p_front[1]*1000), int(p_front[2]*1000)
+
+    def __get_depth(self, img):
+
+        self.depth_can_show = False
+
+        self.cv_depth = self.to_cv(img, "passthrough")
+        if self.state == "tracking":
+
+            # Compute XYZ coordinates
+            u_front = int(self.front_center[0][0] + self.front_center[1][0] / 2)
+            v_front = int(self.front_center[0][1] + self.front_center[1][1] / 2)
+            f = self.__uv_to_xyz(u_front, v_front)
+            u_back = int(self.back_center[0][0] + self.back_center[1][0] / 2)
+            v_back = int(self.back_center[0][1] + self.back_center[1][1] / 2)
+            b = self.__uv_to_xyz(u_back, v_back)
+            # print "Front:  ", f, "  Back: ", b
+
+            # Check if values are correct
+            if not any(x in np.hstack((f, b)) for x in [0, np.nan]):
+
+                # Get the shortest rotation quaternion between points
+                q_xyz = np.cross(f, b)
+                w = np.sqrt(f.dot(f) * b.dot(b)) + np.dot(f, b);
+                q = utils.norm(np.hstack((q_xyz, w)))
+                p_cam = np.vstack((f.reshape(3, 1), np.ones((1,1))))
+                r_cam = tf.transformations.quaternion_matrix(q)
+
+                # Multiply with TF
+                p_world = self.tf_cam_world.dot(p_cam)
+                r_world = utils.R_to_q(self.tf_cam_world.dot(r_cam))
+
+                # Publish the new robot Pose
+                p_ros = Point(p_cam[0], p_cam[1], p_cam[2])
+                q_ros = Quaternion(q[0], q[1], q[2], q[3])
+                pose = Pose(p_ros, q_ros)
+                pose_stamped = PoseStamped()
+                pose_stamped.header.frame_id = "/kinect2_link"
+                pose_stamped.header.stamp = ros.Time.now()
+                pose_stamped.pose = pose
+                self.pose_pub.publish(pose_stamped)
+
+                # Publish a path
+                self.path.header.frame_id = "/kinect2_link"
+                self.path.header.stamp = pose_stamped.header.stamp
+                self.path.poses.append(pose_stamped)
+                self.path_pub.publish(self.path)
+
+                self.path_buf_it += 1
+                if self.path_buf_it > self.path_buf_max :
+                    self.path.poses.pop(0)
+
+            self.depth_can_show = True
+
+    def __analyze_img(self, img):
+
+        self.img_can_show = False
+        self.cv_img = self.to_cv(img)
+
+        self.__fsm()
+
+    def show(self, depth=True, img=True):
+
+        if type(self.cv_depth) is not int and self.depth_can_show and depth:
+            cv2.namedWindow(self.depth_win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.depth_win_name, 1500, 1000)
+            cv2.imshow(self.depth_win_name, self.cv_depth)  
+
+        if type(self.cv_img) is not int and self.img_can_show and img:
+            cv2.namedWindow(self.img_win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.img_win_name, 1500, 1000)
+            cv2.imshow(self.img_win_name, self.cv_img)
+
+        k = cv2.waitKey(3)
+        if k in [27, ord('q')]:
+            t.is_finished = True
+            if img:
+                cv2.destroyWindow(self.img_win_name)
+            if depth:
+                cv2.destroyWindow(self.depth_win_name)
+            utils.cleanup()
+
+if __name__ == '__main__':
+
+    t = Tracker()
+    t.start()
+    while not ros.is_shutdown() and not t.is_finished:
+        t.show(depth=False)
+    t.stop()
