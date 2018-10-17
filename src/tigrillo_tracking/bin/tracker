@@ -10,14 +10,14 @@ import sys
 import time
 
 from image_geometry import PinholeCameraModel
-from geometry_msgs.msg import Point, Quaternion, Pose, PoseStamped
+from geometry_msgs.msg import Point, Quaternion, Pose, PoseStamped, Vector3
 from nav_msgs.msg import Path
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 import sensor_msgs.point_cloud2 as pc2
 import tf
 from cv_bridge import CvBridge, CvBridgeError
 
-from tigrillo_tracking.camshift import CamShift
+from tigrillo_tracking.camshift import CamShift, CustomTracker
 from tigrillo_tracking.drawing import Cropper, Selecter
 from tigrillo_tracking.geometry import  CustomTF
 from tigrillo_tracking import utils
@@ -26,38 +26,52 @@ class Tracker:
 
     def __init__(self):
 
+        # OpenCV variables
         self.cv_bridge = CvBridge()
-        self.tracker_front = None
-        self.tracker_back = None
-        self.cropper_front = None
-        self.cropper_back = None
-
-        self.front_center = None
-        self.back_center = None
-
-        self.image_name = "/kinect2/hd/image_color_rect"
-        self.depth_name = "/kinect2/hd/image_depth_rect"
-        self.point_name = "/kinect2/hd/points"
-        self.camera_model_name = "/kinect2/hd/camera_info"
-        self.pose_name = "/tigrillo_rob/pose"
-        self.path_name = "/tigrillo_rob/path"
-        self.path = None
-        self.path_buf_it = 0
-        self.path_buf_max = 200
-
         self.cv_img = 0
         self.cv_depth = 0
         self.img_win_name = "Image Window"
         self.depth_win_name = "Depth Window"
 
-        self.world_point_list = [[0.6, 0, 0], [1.2, 0, 0], [1.8, 0, 0],
-                                 [2.4, 0, 0], [0.6, 0.6, 0], [1.2, 0.6, 0.4],
-                                 [1.8, 0.6, 0], [2.4, 0.6, 0]]
+        # Camshift algorithm
+        self.tracker_front = None
+        self.tracker_back = None
+        self.cropper_front = None
+        self.cropper_back = None
+        self.front_center = None
+        self.back_center = None
+
+        # If false, use custom algorithm (based on scenario)
+        self.camshift = False
+        if self.camshift:
+            self.qual = "hd"
+        else:
+            self.qual = "sd"
+
+        # ROS topics variables
+        self.image_name = "/kinect2/" + self.qual + "/image_color_rect"
+        self.depth_name = "/kinect2/" + self.qual + "/image_depth_rect"
+        self.point_name = "/kinect2/" + self.qual + "/points"
+        self.camera_model_name = "/kinect2/" + self.qual + "/camera_info"
+        self.pose_f_name = "/tigrillo_rob/front"
+        self.pose_b_name = "/tigrillo_rob/back"
+        self.path_name = "/tigrillo_rob/path"
+        self.euler_name = "/tigrillo_rob/euler"
+        self.path = None
+        self.path_buf_it = 0
+        self.path_buf_max = 200
+
+        # Camera to World transformation algorithm variables
+        self.world_point_list = [[600, -1200, 0], [1200, -1200, 0],
+                                 [0, -600, 0], [600, -600, 0],  [1200, -600, 0], [1800, -600, 0],
+                                 [0, 0, 0],    [600, 0, 0],     [1200, 0, 0],    [1800, 0, 0], 
+                                 [0, 600, 0],  [600, 600, 0], [1200, 600, 0],  [1800, 600, 400]]
         self.world_point_curr = 0
         self.save_tf = True
-        self.load_tf = True
+        self.load_tf = False
         self.tf_cam_world = None
 
+        # Manage the Finite State Machine of the algorithm
         self.state = "init"
         self.is_finished = False
         self.img_can_show = False
@@ -78,8 +92,10 @@ class Tracker:
         self.camera_model_sub = ros.Subscriber(self.camera_model_name, CameraInfo, self.__get_calib_camera_model)
         
         # Pose publication topic
-        self.pose_pub = ros.Publisher(self.pose_name, PoseStamped, queue_size=1)
+        self.pose_f_pub = ros.Publisher(self.pose_f_name, PoseStamped, queue_size=1)
+        self.pose_b_pub = ros.Publisher(self.pose_b_name, PoseStamped, queue_size=1)
         self.path_pub = ros.Publisher(self.path_name, Path, queue_size=1)
+        self.euler_pub = ros.Publisher(self.euler_name, Vector3, queue_size=1)
         self.path = Path()
         
         # Open Window
@@ -108,51 +124,52 @@ class Tracker:
             if self.state == "init":
 
                 if not self.load_tf:
-                    self.state = "set_point_" + str(self.world_point_curr)
                     self.img_can_show = True
+                    self.world_tf = CustomTF(save_tf=self.save_tf)
+                    self.selecter = Selecter(self, self.img_win_name)
+                    self.selecter.start()
+                    self.state = "set_point_" + str(self.world_point_curr)
                     ros.loginfo("State: " + self.state + \
                                 ": Select coordinate " + \
                                 str(self.world_point_list[self.world_point_curr]) + \
                                 " on the image!")
-                    self.world_tf = CustomTF(save_tf=self.save_tf)
-                    self.selecter = Selecter(self, self.img_win_name)
-                    self.selecter.start()
-                    time.sleep(1)
-                    u, v = self.selecter.get_points()
-                    p = self.__uv_to_xyz(u, v)
-                    if not any(x in p for x in [0, np.nan]):
-                        self.world_tf.append(self.world_point_list[self.world_point_curr], 
-                                         p)
-                    self.world_point_curr += 1
-                    self.state = "set_point_" + str(self.world_point_curr)
                 else:
                     self.world_tf = CustomTF(self.save_tf)
                     self.tf_cam_world = self.world_tf.get_tf_cam_world(self.load_tf)
-                    ros.loginfo("Crop the front ROI!")
-                    self.cropper_front = Cropper(self, self.img_win_name)
-                    self.cropper_front.start()
-                    self.state = "cropping_front"
-
-            # Iterative State to get points
-            elif "set_point" in self.state:
-
-                self.img_can_show = True
-                if self.selecter.is_finished:
-                    if self.world_point_curr >= len(self.world_point_list):
-                        self.selecter.stop()
-                        del self.selecter
-                        self.tf_cam_world = self.world_tf.get_tf_cam_world()
-                        ros.logwarn("World Frame transformation has been computer given the set of points")
+                    ros.logwarn("World Frame transformation has been loaded from memory")
+                    if self.camshift:                        
                         ros.loginfo("Crop the front ROI!")
                         time.sleep(1)
                         self.cropper_front = Cropper(self, self.img_win_name)
                         self.cropper_front.start()
                         self.state = "cropping_front"
                     else:
-                        ros.loginfo("State: " + self.state + \
-                                    ": Select coordinate " + \
-                                    str(self.world_point_list[self.world_point_curr]) + \
-                                    " on the image!")
+                        self.tracker_front = CustomTracker()
+                        self.tracker_back = CustomTracker("back")
+                        self.state = "tracking"
+
+            # Iterative State to get points
+            elif "set_point" in self.state:
+
+                self.img_can_show = True
+                if self.selecter.is_finished:
+                    if self.world_point_curr >= (len(self.world_point_list) -1):
+                        self.selecter.stop()
+                        del self.selecter
+                        self.tf_cam_world = self.world_tf.get_tf_cam_world()
+                        ros.logwarn("World Frame transformation has been computer given the set of points")
+                        if self.camshift:                        
+                            ros.loginfo("Crop the front ROI!")
+                            time.sleep(1)
+                            self.cropper_front = Cropper(self, self.img_win_name)
+                            self.cropper_front.start()
+                            self.state = "cropping_front"
+                        else:
+                            self.tracker_front = CustomTracker()
+                            self.tracker_back = CustomTracker("back")
+                            self.state = "tracking"
+
+                    else:
                         u, v = self.selecter.get_points()
                         p = self.__uv_to_xyz(u, v)
                         if not any(x in p for x in [0, np.nan]):
@@ -163,7 +180,11 @@ class Tracker:
                         self.selecter = Selecter(self, self.img_win_name)
                         self.selecter.start()
                         self.state = "set_point_" + str(self.world_point_curr)
-                    self.world_point_curr += 1
+                        self.world_point_curr += 1
+                        ros.loginfo("State: " + self.state + \
+                                    ": Select coordinate " + \
+                                    str(self.world_point_list[self.world_point_curr]) + \
+                                    " on the image!")
 
             # Cropping Front State
             elif self.state == "cropping_front":
@@ -201,7 +222,6 @@ class Tracker:
 
             # Tracking State
             elif self.state == "tracking":
-
                 self.front_center = self.tracker_front.process(self.cv_img)
                 self.back_center = self.tracker_back.process(self.cv_img)
                 self.cv_img = self.tracker_front.draw(self.cv_img, "green")
@@ -220,7 +240,7 @@ class Tracker:
         x = r[0] * z / r[2]
         y = r[1] * z / r[2]
 
-        return np.array([x/1000, y/1000, z/1000])
+        return np.array([x, y, z])
 
     def __get_points(self, pcl):
 
@@ -250,42 +270,56 @@ class Tracker:
         if self.state == "tracking":
 
             # Compute XYZ coordinates
-            u_front = int(self.front_center[0][0] + self.front_center[1][0] / 2)
-            v_front = int(self.front_center[0][1] + self.front_center[1][1] / 2)
+            u_front = int(self.front_center[0][0])
+            v_front = int(self.front_center[0][1])
             f = self.__uv_to_xyz(u_front, v_front)
-            u_back = int(self.back_center[0][0] + self.back_center[1][0] / 2)
-            v_back = int(self.back_center[0][1] + self.back_center[1][1] / 2)
+
+            u_back = int(self.back_center[0][0])
+            v_back = int(self.back_center[0][1])
             b = self.__uv_to_xyz(u_back, v_back)
             # print "Front:  ", f, "  Back: ", b
 
             # Check if values are correct
-            if not any(x in np.hstack((f, b)) for x in [0, np.nan]):
-
-                # Get the shortest rotation quaternion between points
-                q_xyz = np.cross(f, b)
-                w = np.sqrt(f.dot(f) * b.dot(b)) + np.dot(f, b);
-                q = utils.norm(np.hstack((q_xyz, w)))
-                p_cam = np.vstack((f.reshape(3, 1), np.ones((1,1))))
-                r_cam = tf.transformations.quaternion_matrix(q)
+            if (not any(x in np.hstack((f, b)) for x in [0, np.nan])) and \
+               (not (u_back == 0 and v_back == 0)) and (not (u_front == 0 and v_front == 0)):
 
                 # Multiply with TF
-                p_world = self.tf_cam_world.dot(p_cam)
-                r_world = utils.R_to_q(self.tf_cam_world.dot(r_cam))
+                p_cam_f = np.vstack((f.reshape(3, 1), np.ones((1,1))))
+                p_cam_b = np.vstack((b.reshape(3, 1), np.ones((1,1))))
+                p_world_f = self.tf_cam_world.dot(p_cam_f)[0:3].T
+                p_world_b = self.tf_cam_world.dot(p_cam_b)[0:3].T
+
+                # Get the shortest rotation quaternion between points
+                p_diff = (p_world_f - p_world_b).T
+                p_diff_norm = np.linalg.norm(p_diff)
+                roll = 0
+                pitch = 2*np.arcsin(p_diff[2]/p_diff_norm)
+                yaw = 2*np.arccos(p_diff[0]/p_diff_norm)
+                q_world = tf.transformations.quaternion_from_euler(roll, pitch, yaw)
+
+                # Publish Euler angles
+                self.euler_pub.publish(x=roll/np.pi*180, y=pitch/np.pi*180, z=yaw/np.pi*180)
 
                 # Publish the new robot Pose
-                p_ros = Point(p_cam[0], p_cam[1], p_cam[2])
-                q_ros = Quaternion(q[0], q[1], q[2], q[3])
-                pose = Pose(p_ros, q_ros)
-                pose_stamped = PoseStamped()
-                pose_stamped.header.frame_id = "/kinect2_link"
-                pose_stamped.header.stamp = ros.Time.now()
-                pose_stamped.pose = pose
-                self.pose_pub.publish(pose_stamped)
+                p_f_ros = Point(p_world_f.T[0], p_world_f.T[1], p_world_f.T[2])
+                p_b_ros = Point(p_world_b.T[0], p_world_b.T[1], p_world_b.T[2])
+                q_ros = Quaternion(q_world[0], q_world[1], q_world[2], q_world[3])
+                pose_f = Pose(p_f_ros, q_ros)
+                pose_b = Pose(p_b_ros, q_ros)
+                pose_s_f = PoseStamped()
+                pose_s_b = PoseStamped()
+                pose_s_f.header.frame_id = "/kinect2_link"
+                pose_s_f.header.stamp = ros.Time.now()
+                pose_s_b.header = pose_s_f.header
+                pose_s_f.pose = pose_f
+                pose_s_b.pose = pose_b
+
+                self.pose_f_pub.publish(pose_s_f)
+                self.pose_b_pub.publish(pose_s_b)
 
                 # Publish a path
-                self.path.header.frame_id = "/kinect2_link"
-                self.path.header.stamp = pose_stamped.header.stamp
-                self.path.poses.append(pose_stamped)
+                self.path.header = pose_s_f.header
+                self.path.poses.append(pose_s_f)
                 self.path_pub.publish(self.path)
 
                 self.path_buf_it += 1

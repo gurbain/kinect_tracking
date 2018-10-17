@@ -1,0 +1,94 @@
+#!/usr/bin/python
+
+import numpy as np
+import rospy as ros
+from tf import transformations
+import time
+
+from geometry_msgs.msg import Point, Quaternion, Pose, PoseStamped, Vector3
+from gazebo_msgs.msg import LinkStates
+from nav_msgs.msg import Path
+
+from tigrillo_tracking import utils
+
+class SimTracking:
+
+    def __init__(self):
+
+        self.gazebo_link_name = "/gazebo/link_states"
+        self.pose_f_name = "/tigrillo_sim/front"
+        self.pose_b_name = "/tigrillo_sim/back"
+        self.path_name = "/tigrillo_sim/path"
+        self.euler_name = "/tigrillo_sim/euler"
+        self.path_buf_max = 200
+
+    def start(self):
+
+        ros.init_node('sim_tracker', anonymous=True)
+
+        # Gazebo subscription
+        self.gazebo_sub = ros.Subscriber(self.gazebo_link_name, LinkStates, self.__publish_pose)
+
+        # Pose publication topic
+        self.pose_f_pub = ros.Publisher(self.pose_f_name, PoseStamped, queue_size=1)
+        self.pose_b_pub = ros.Publisher(self.pose_b_name, PoseStamped, queue_size=1)
+        self.path_pub = ros.Publisher(self.path_name, Path, queue_size=1)
+        self.euler_pub = ros.Publisher(self.euler_name, Vector3, queue_size=1)
+        self.path = Path()
+        self.path_buf_it = 0
+
+    def stop(self):
+
+        utils.cleanup()
+
+    def __publish_pose(self, msg):
+
+        f = msg.pose[msg.name.index("tigrillo::tigrillo::body_front")]
+        b = msg.pose[msg.name.index("tigrillo::tigrillo::body_hind")]
+
+        # Change pose
+        f.position.x = f.position.x * 1000
+        f.position.y = f.position.y * 1000
+        f.position.z = f.position.z * 1000
+        b.position.x = b.position.x * 1000
+        b.position.y = b.position.y * 1000
+        b.position.z = b.position.z * 1000
+
+        # Get the shortest rotation between points and publish euler angles
+        p_world_f = np.array([f.position.x, f.position.y, f.position.z])
+        p_world_b = np.array([b.position.x, b.position.y, b.position.z])
+        p_diff = (p_world_f - p_world_b).T
+        p_diff_norm = np.linalg.norm(p_diff)
+        roll = 0
+        pitch = 2*np.arcsin(p_diff[2]/p_diff_norm)
+        yaw = 2*np.arccos(p_diff[0]/p_diff_norm)
+        self.euler_pub.publish(x=roll/np.pi*180, y=pitch/np.pi*180, z=yaw/np.pi*180)
+
+        # Publish the new robot Pose
+        pose_s_f = PoseStamped()
+        pose_s_b = PoseStamped()
+        pose_s_f.header.frame_id = "/map"
+        pose_s_f.header.stamp = ros.Time.now()
+        pose_s_b.header = pose_s_f.header
+        pose_s_f.pose = f
+        pose_s_b.pose = b
+        self.pose_f_pub.publish(pose_s_f)
+        self.pose_b_pub.publish(pose_s_b)
+
+        # Publish a path
+        self.path.header = pose_s_f.header
+        self.path.poses.append(pose_s_f)
+        self.path_pub.publish(self.path)
+
+        self.path_buf_it += 1
+        if self.path_buf_it > self.path_buf_max :
+            self.path.poses.pop(0)
+
+
+if __name__ == "__main__":
+
+    t = SimTracking()
+    t.start()
+    while not ros.is_shutdown():
+        time.sleep(0.1)
+    t.stop()
